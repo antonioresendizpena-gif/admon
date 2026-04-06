@@ -390,6 +390,7 @@ input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none}
       </div>
       <div class="topbar-right">
         <div class="live-badge"><div class="pulse-dot"></div>LIVE</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--dim)" id="sync-status">☁️ Conectando...</div>
         <div style="font-family:var(--mono);font-size:9px;color:var(--dim)" id="tb-date"></div>
       </div>
     </div>
@@ -521,8 +522,10 @@ input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none}
         </div>
         <div style="margin-top:16px;display:flex;gap:10px;flex-wrap:wrap">
           <button class="btn btn-p" onclick="exportData()">📤 Exportar JSON</button>
+          <button class="btn btn-c" onclick="importBackup()">📥 Importar backup</button>
           <button class="btn btn-r" onclick="clearData()">🗑️ Limpiar datos</button>
         </div>
+        <input type="file" id="import-file" accept=".json" style="display:none" onchange="loadBackupFile(this)">
       </div>
     </div>
   </main>
@@ -624,7 +627,78 @@ input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none}
 
 <div class="toast-container" id="toasts"></div>
 
-<script>
+<script type="module">
+// ═══════════════ FIREBASE CONFIG ═══════════════
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
+import { getFirestore, doc, setDoc, getDoc, onSnapshot } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
+
+const firebaseConfig = {
+  apiKey: "AIzaSyCG4N3x7iWnEbp6QMyueU7UB3w67xVxpqU",
+  authDomain: "financeos-64b18.firebaseapp.com",
+  projectId: "financeos-64b18",
+  storageBucket: "financeos-64b18.firebasestorage.app",
+  messagingSenderId: "950279803734",
+  appId: "1:950279803734:web:e1b110edebaf32d0977cf7"
+};
+
+const fbApp = initializeApp(firebaseConfig);
+const db    = getFirestore(fbApp);
+const DOC   = doc(db, 'financeos', 'main');
+
+// ── Firebase save/load ──
+let fbUnsubscribe = null;
+let fbReady = false;
+let savePending = false;
+
+async function fbSave(state) {
+  try {
+    await setDoc(DOC, { data: JSON.stringify(state) });
+    setSyncStatus('saved');
+  } catch(e) {
+    console.warn('Firebase save error:', e);
+    setSyncStatus('error');
+  }
+}
+
+async function fbLoad() {
+  try {
+    const snap = await getDoc(DOC);
+    if (snap.exists()) {
+      const parsed = JSON.parse(snap.data().data);
+      return parsed;
+    }
+    return null;
+  } catch(e) {
+    console.warn('Firebase load error:', e);
+    return null;
+  }
+}
+
+function fbListen(onChange) {
+  if (fbUnsubscribe) fbUnsubscribe();
+  fbUnsubscribe = onSnapshot(DOC, (snap) => {
+    if (snap.exists() && fbReady) {
+      try {
+        const parsed = JSON.parse(snap.data().data);
+        onChange(parsed);
+      } catch(e) {}
+    }
+  });
+}
+
+function setSyncStatus(status) {
+  const el = document.getElementById('sync-status');
+  if (!el) return;
+  const map = {
+    syncing: '🔄 Sincronizando...',
+    saved:   '☁️ Sincronizado',
+    error:   '⚠️ Sin conexión',
+    offline: '💾 Local'
+  };
+  el.textContent = map[status] || status;
+  el.style.color = status==='saved'?'var(--green)':status==='error'?'var(--orange)':'var(--dim)';
+}
+
 // ═══════════════ CONSTANTS ═══════════════
 const MONTHS = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
 const PLAN_YEARS = [2024,2025,2026,2027,2028,2029,2030];
@@ -760,31 +834,83 @@ const DEF_PROJECTS = [
 ];
 
 // ═══════════════ STATE ═══════════════
+function normalizeState(s) {
+  PLAN_YEARS.forEach(y => { if (!s.planYears[y]) s.planYears[y] = []; });
+  if (!s.users) s.users = [];
+  if (!s.nextId) s.nextId = 200;
+  return s;
+}
+
+function defaultState() {
+  return {
+    creds: JSON.parse(JSON.stringify(DEF_CREDS)),
+    transactions: JSON.parse(JSON.stringify(DEF_TX)),
+    categories: JSON.parse(JSON.stringify(DEF_CATS)),
+    planYears: JSON.parse(JSON.stringify(DEF_PLAN)),
+    projects: JSON.parse(JSON.stringify(DEF_PROJECTS)),
+    users: [],
+    nextId: 200
+  };
+}
+
 function loadState() {
   try {
     const raw = localStorage.getItem('fos_v3');
     if (!raw) throw new Error('no data');
-    const s = JSON.parse(raw);
-    // ensure all years exist
-    PLAN_YEARS.forEach(y => { if (!s.planYears[y]) s.planYears[y] = []; });
-    if (!s.users) s.users = [];
-    return s;
+    return normalizeState(JSON.parse(raw));
   } catch(e) {
-    return {
-      creds: DEF_CREDS,
-      transactions: JSON.parse(JSON.stringify(DEF_TX)),
-      categories: JSON.parse(JSON.stringify(DEF_CATS)),
-      planYears: JSON.parse(JSON.stringify(DEF_PLAN)),
-      projects: JSON.parse(JSON.stringify(DEF_PROJECTS)),
-      users: [],
-      nextId: 200
-    };
+    return defaultState();
   }
 }
-function save() { localStorage.setItem('fos_v3', JSON.stringify(S)); }
+
+// Save to both localStorage (instant) and Firebase (cloud sync)
+function save() {
+  localStorage.setItem('fos_v3', JSON.stringify(S));
+  setSyncStatus('syncing');
+  fbSave(S);
+}
+
+// Called when Firebase has fresher data from another device
+function onRemoteUpdate(remoteState) {
+  // Only update if remote is newer (higher nextId = more recent)
+  if (remoteState.nextId > S.nextId) {
+    S = normalizeState(remoteState);
+    localStorage.setItem('fos_v3', JSON.stringify(S));
+    syncProjects();
+    renderAll();
+    toast('🔄 Datos sincronizados desde otro dispositivo', 'success');
+  }
+}
 
 let S = loadState();
 let currentUser = null; // null = admin
+
+// ── Bootstrap: load from Firebase on startup ──
+async function initFirebase() {
+  setSyncStatus('syncing');
+  try {
+    const remote = await fbLoad();
+    if (remote) {
+      const remNorm = normalizeState(remote);
+      if (remNorm.nextId >= S.nextId) {
+        S = remNorm;
+        localStorage.setItem('fos_v3', JSON.stringify(S));
+      } else {
+        // Local is newer — push it to Firebase
+        await fbSave(S);
+      }
+    } else {
+      // First time in Firebase — push local data
+      await fbSave(S);
+    }
+    setSyncStatus('saved');
+    fbReady = true;
+    fbListen(onRemoteUpdate);
+  } catch(e) {
+    console.warn('Firebase init error:', e);
+    setSyncStatus('error');
+  }
+}
 
 // ═══════════════ HELPERS ═══════════════
 function fmt(n) { return new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN',minimumFractionDigits:0,maximumFractionDigits:0}).format(n||0); }
@@ -858,6 +984,12 @@ function startApp() {
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('l-error').style.display = 'none';
   document.getElementById('app').style.display = 'block';
+  initFirebase().then(() => {
+    // Re-render after Firebase data is loaded
+    syncProjects();
+    renderAll();
+    checkReminders();
+  });
   initApp();
 }
 
@@ -1575,6 +1707,31 @@ function exportData() {
   const blob=new Blob([JSON.stringify(S,null,2)],{type:'application/json'});
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='financeOS_backup.json';a.click();
   toast('📤 Datos exportados');
+}
+function importBackup() {
+  document.getElementById('import-file').click();
+}
+function loadBackupFile(input) {
+  const file = input.files[0]; if(!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      const data = JSON.parse(e.target.result);
+      if (!data.transactions || !data.creds) { toast('Archivo inválido','error'); return; }
+      if(!confirm('¿Importar este backup? Se reemplazarán los datos actuales.')) return;
+      S = normalizeState(data);
+      // Give it a higher nextId so Firebase accepts it
+      S.nextId = Math.max(S.nextId, Date.now() % 1000000);
+      save();
+      syncProjects();
+      renderAll();
+      toast('✅ Backup importado y sincronizado a la nube');
+    } catch(err) {
+      toast('Error al leer el archivo','error');
+    }
+  };
+  reader.readAsText(file);
+  input.value = '';
 }
 function clearData() {
   if(!confirm('¿Eliminar TODOS los datos?')||!confirm('¿Seguro? No se puede deshacer.')) return;
